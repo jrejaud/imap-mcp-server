@@ -1,6 +1,7 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { ImapAccount, EmailMessage, EmailContent, Folder, SearchCriteria } from '../types/index.js';
+import type { AccountManager } from './account-manager.js';
 
 interface ConnectionState {
   client: ImapFlow;
@@ -18,6 +19,11 @@ export class ImapService {
   private connections: Map<string, ConnectionState> = new Map();
   private reconnectAttempts: Map<string, number> = new Map();
   private maxReconnectAttempts = 3;
+  private accountManager?: AccountManager;
+
+  setAccountManager(accountManager: AccountManager): void {
+    this.accountManager = accountManager;
+  }
 
   async connect(account: ImapAccount): Promise<void> {
     const existing = this.connections.get(account.id);
@@ -76,9 +82,19 @@ export class ImapService {
   }
 
   private async ensureConnected(accountId: string): Promise<ImapFlow> {
-    const state = this.connections.get(accountId);
+    let state = this.connections.get(accountId);
     if (!state) {
-      throw new Error(`No connection configured for account ${accountId}`);
+      // Auto-connect using stored account credentials
+      if (this.accountManager) {
+        const account = this.accountManager.getAccount(accountId);
+        if (account) {
+          await this.connect(account);
+          state = this.connections.get(accountId);
+        }
+      }
+      if (!state) {
+        throw new Error(`No connection configured for account ${accountId}`);
+      }
     }
 
     if (!state.isConnected || !state.client.usable) {
@@ -252,6 +268,29 @@ export class ImapService {
       } = options;
       const textAttachmentExtensions = ['.txt', '.md', '.markdown', '.csv', '.log', '.json', '.xml', '.yml', '.yaml'];
 
+      // Extract all raw headers as key-value pairs
+      const headers: Record<string, string | string[]> = {};
+      if (parsed.headers) {
+        const headerToString = (v: unknown): string => {
+          if (typeof v === 'string') return v;
+          if (v instanceof Date) return v.toISOString();
+          if (v && typeof v === 'object' && 'text' in v) return String((v as { text: string }).text);
+          if (v && typeof v === 'object' && 'value' in v) return String((v as { value: string }).value);
+          if (v && typeof v === 'object') return JSON.stringify(v);
+          return String(v);
+        };
+
+        for (const [key, value] of parsed.headers) {
+          if (typeof value === 'string') {
+            headers[key] = value;
+          } else if (Array.isArray(value)) {
+            headers[key] = value.map(headerToString);
+          } else {
+            headers[key] = headerToString(value);
+          }
+        }
+      }
+
       return {
         uid,
         date: parsed.date || new Date(),
@@ -261,6 +300,7 @@ export class ImapService {
         messageId: parsed.messageId || '',
         inReplyTo: parsed.inReplyTo as string | undefined,
         flags: Array.from(source.flags || []),
+        headers,
         textContent: parsed.text,
         htmlContent: parsed.html || undefined,
         attachments: parsed.attachments?.map((att: any) => {
@@ -314,6 +354,45 @@ export class ImapService {
     }
   }
 
+  async getAttachmentContent(
+    accountId: string,
+    folderName: string,
+    uid: number,
+    filename: string
+  ): Promise<{ content: Buffer; contentType: string; filename: string }> {
+    const client = await this.ensureConnected(accountId);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+
+      const source = await client.fetchOne(uid, { source: true }, { uid: true });
+
+      if (!source || !source.source) {
+        throw new Error(`Email with UID ${uid} not found`);
+      }
+
+      const parsed = await simpleParser(source.source);
+      const attachment = parsed.attachments?.find(
+        (att: any) => att.filename === filename || att.contentId === filename
+      );
+
+      if (!attachment) {
+        throw new Error(`Attachment "${filename}" not found in email UID ${uid}`);
+      }
+
+      return {
+        content: attachment.content,
+        contentType: attachment.contentType || 'application/octet-stream',
+        filename: attachment.filename || 'unknown',
+      };
+    } finally {
+      if (lock) {
+        lock.release();
+      }
+    }
+  }
+
   async markAsRead(accountId: string, folderName: string, uid: number): Promise<void> {
     const client = await this.ensureConnected(accountId);
 
@@ -344,11 +423,20 @@ export class ImapService {
 
   async deleteEmail(accountId: string, folderName: string, uid: number): Promise<void> {
     const client = await this.ensureConnected(accountId);
+    const connState = this.connections.get(accountId);
+    const isGmail = connState?.account?.host?.includes('gmail') || connState?.account?.host?.includes('google');
+    const trashFolder = isGmail ? '[Gmail]/Trash' : 'Trash';
 
     let lock;
     try {
       lock = await client.getMailboxLock(folderName);
-      await client.messageDelete(uid, { uid: true });
+      if (folderName === trashFolder) {
+        // Already in Trash, permanently delete
+        await client.messageDelete(uid, { uid: true });
+      } else {
+        // Move to Trash instead of permanent expunge
+        await client.messageMove(uid, trashFolder, { uid: true });
+      }
     } finally {
       if (lock) {
         lock.release();
@@ -364,6 +452,10 @@ export class ImapService {
     onProgress?: (deleted: number, total: number) => void
   ): Promise<{ deleted: number; failed: number; errors: string[] }> {
     const client = await this.ensureConnected(accountId);
+    const connState = this.connections.get(accountId);
+    const isGmail = connState?.account?.host?.includes('gmail') || connState?.account?.host?.includes('google');
+    const trashFolder = isGmail ? '[Gmail]/Trash' : 'Trash';
+    const isAlreadyInTrash = folderName === trashFolder;
 
     let deleted = 0;
     let failed = 0;
@@ -380,9 +472,13 @@ export class ImapService {
 
         lock = await client.getMailboxLock(folderName);
 
-        // Use sequence set for bulk delete
+        // Use sequence set for bulk operations
         const uidSet = chunk.join(',');
-        await client.messageDelete(uidSet, { uid: true });
+        if (isAlreadyInTrash) {
+          await client.messageDelete(uidSet, { uid: true });
+        } else {
+          await client.messageMove(uidSet, trashFolder, { uid: true });
+        }
 
         deleted += chunk.length;
 
