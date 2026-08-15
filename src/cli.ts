@@ -10,6 +10,7 @@ import { SmtpService } from './services/smtp-service.js';
 import { SpamService } from './services/spam-service.js';
 import { ImapAccount, EmailAttachment, EmailComposer, SearchCriteria } from './types/index.js';
 import { shouldSaveToSent } from './utils/sent-folder.js';
+import { validateEmail } from './services/email-validator.js';
 
 dotenv.config({ quiet: true });
 
@@ -21,7 +22,7 @@ const smtpService = new SmtpService();
 const spamService = new SpamService();
 imapService.setAccountManager(accountManager);
 
-type ExitCode = 0 | 1 | 2 | 3 | 4;
+type ExitCode = 0 | 1 | 2 | 3 | 4 | 6 | 7;
 
 function emit(payload: unknown): void {
   process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
@@ -549,6 +550,29 @@ program
     if (!ok) fail(1, `Failed to append draft to "${drafts}"`);
     emit({ success: true, folder: drafts });
     await imapService.disconnect(account.id).catch(() => {});
+  });
+
+// ---------- RECIPIENT VALIDATION ----------
+
+program
+  .command('validate-email <address>')
+  .description('Check a recipient address before sending: syntax, then DNS MX, then (with --smtp) an SMTP RCPT probe that never sends DATA. Verdict is valid|invalid|unknown.')
+  .option('--smtp', 'Also probe the MX server with RCPT TO (best-effort; needs outbound port 25)')
+  .option('--timeout <ms>', 'Per-step timeout in milliseconds', '5000')
+  .option('--helo <hostname>', 'Hostname to announce in EHLO (default: this machine)')
+  .option('--mail-from <address>', 'Reverse-path for the probe (default: null sender <>)')
+  .option('--port <n>', 'SMTP port to probe', '25')
+  .action(async (address, opts) => {
+    const result = await validateEmail(address, {
+      smtp: Boolean(opts.smtp),
+      timeoutMs: Number(opts.timeout),
+      helo: opts.helo,
+      mailFrom: opts.mailFrom,
+      port: Number(opts.port),
+    });
+    emit({ success: true, ...result, smtpProbed: Boolean(opts.smtp) });
+    if (result.verdict === 'invalid') process.exit(6);
+    if (result.verdict === 'unknown') process.exit(7);
   });
 
 // ---------- ATTACHMENTS ----------
