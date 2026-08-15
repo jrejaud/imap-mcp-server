@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import dotenv from 'dotenv';
@@ -30,6 +28,9 @@ const imapService = new ImapService();
 const accountManager = new AccountManager();
 const smtpService = new SmtpService();
 const spamService = new SpamService();
+
+// Allow ImapService to auto-connect using stored credentials
+imapService.setAccountManager(accountManager);
 
 // Register all tools
 registerTools(server, imapService, accountManager, smtpService, spamService);

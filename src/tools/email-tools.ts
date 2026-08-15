@@ -2,7 +2,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ImapService } from '../services/imap-service.js';
 import { AccountManager } from '../services/account-manager.js';
 import { SmtpService } from '../services/smtp-service.js';
+import { shouldSaveToSent } from '../utils/sent-folder.js';
 import { z } from 'zod';
+import { join } from 'path';
+import { homedir } from 'os';
+
+const DOWNLOAD_DIR = process.env.IMAP_DOWNLOAD_DIR || join(homedir(), 'Downloads', 'imap-attachments');
 
 export function emailTools(
   server: McpServer,
@@ -33,7 +38,7 @@ export function emailTools(
       before: z.string().optional().describe('Search emails before date (YYYY-MM-DD)'),
       seen: z.boolean().optional().describe('Filter by read/unread status'),
       flagged: z.boolean().optional().describe('Filter by flagged status'),
-      limit: z.number().optional().default(50).describe('Maximum number of results'),
+      limit: z.coerce.number().optional().default(50).describe('Maximum number of results'),
     }
   }, async ({ accountId, folder, limit, ...searchCriteria }) => {
     const criteria: any = {};
@@ -68,12 +73,13 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.number().describe('Email UID'),
-      maxContentLength: z.number().default(10000).describe('Maximum characters to return for text and HTML body content'),
+      uid: z.coerce.number().describe('Email UID'),
+      maxContentLength: z.coerce.number().default(10000).describe('Maximum characters to return for text and HTML body content'),
       includeAttachmentText: z.boolean().default(true).describe('Include text attachment previews when available'),
-      maxAttachmentTextChars: z.number().default(100000).describe('Maximum characters to return per text attachment'),
+      maxAttachmentTextChars: z.coerce.number().default(100000).describe('Maximum characters to return per text attachment'),
+      includeHeaders: z.boolean().default(false).describe('Include raw email headers (e.g. List-Unsubscribe, List-Unsubscribe-Post)'),
     }
-  }, async ({ accountId, folder, uid, maxContentLength, includeAttachmentText, maxAttachmentTextChars }) => {
+  }, async ({ accountId, folder, uid, maxContentLength, includeAttachmentText, maxAttachmentTextChars, includeHeaders }) => {
     const email = await imapService.getEmailContent(accountId, folder, uid, {
       includeAttachmentText,
       maxAttachmentTextChars,
@@ -84,16 +90,148 @@ export function emailTools(
       ? { text: textTruncated || undefined, html: htmlTruncated || undefined }
       : undefined;
     
+    const { headers: rawHeaders, ...emailWithoutHeaders } = email;
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           email: {
-            ...email,
+            ...emailWithoutHeaders,
             textContent: email.textContent?.substring(0, maxContentLength),
             htmlContent: email.htmlContent?.substring(0, maxContentLength),
             contentTruncated,
+            ...(includeHeaders ? { headers: rawHeaders } : {}),
           },
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Upload file tool - writes a file to the container for use as an email attachment
+  server.registerTool('imap_upload_file', {
+    description: 'Upload a file to the server for use as an email attachment. Returns a path that can be used with imap_send_email attachments. This allows sending large attachments without hitting context window limits by passing base64 content through this tool first, then referencing the path.',
+    inputSchema: {
+      filename: z.string().describe('Filename to save as'),
+      content: z.string().describe('Base64 encoded file content'),
+      contentType: z.string().optional().describe('MIME type (optional, used for metadata only)'),
+    }
+  }, async ({ filename, content, contentType }) => {
+    const fs = await import('fs');
+    const path = await import('path');
+
+    // Create uploads directory under the downloads directory
+    const uploadDir = path.join(DOWNLOAD_DIR, 'uploads');
+    fs.mkdirSync(uploadDir, { recursive: true });
+
+    // Sanitize filename to prevent path traversal
+    const sanitizedFilename = path.basename(filename);
+    const targetPath = path.join(uploadDir, sanitizedFilename);
+
+    // Decode base64 and write file
+    const buffer = Buffer.from(content, 'base64');
+    fs.writeFileSync(targetPath, buffer);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          path: targetPath,
+          filename: sanitizedFilename,
+          size: buffer.length,
+          contentType: contentType || 'application/octet-stream',
+          message: `File uploaded successfully. Use this path in imap_send_email attachments: ${targetPath}`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Download attachment tool
+  server.registerTool('imap_download_attachment', {
+    description: 'Download an attachment from an email. Returns image content directly for image attachments, extracts text from PDFs, or saves to a shared downloads directory accessible from the host.',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+      filename: z.string().describe('Attachment filename or contentId'),
+      savePath: z.string().optional().describe('Optional file path to save the attachment to. If not provided, files are saved to the shared downloads directory.'),
+      extractText: z.boolean().default(true).describe('For PDFs, extract and return text content inline'),
+    }
+  }, async ({ accountId, folder, uid, filename, savePath, extractText }) => {
+    const { content, contentType, filename: resolvedFilename } = await imapService.getAttachmentContent(accountId, folder, uid, filename);
+
+    const isImage = contentType.startsWith('image/');
+    const isPdf = contentType === 'application/pdf' || resolvedFilename.toLowerCase().endsWith('.pdf');
+
+    if (isImage && !savePath) {
+      // Return image inline as base64 for Claude to view
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Attachment: ${resolvedFilename} (${contentType}, ${content.length} bytes)`,
+          },
+          {
+            type: 'image' as const,
+            data: content.toString('base64'),
+            mimeType: contentType,
+          },
+        ]
+      };
+    }
+
+    // For PDFs, try to extract text inline
+    if (isPdf && extractText) {
+      try {
+        const pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default;
+        const pdfData = await pdfParse(content);
+
+        // Also save the file for binary access
+        const fs = await import('fs');
+        const path = await import('path');
+        const downloadDir = savePath ? path.dirname(savePath) : DOWNLOAD_DIR;
+        fs.mkdirSync(downloadDir, { recursive: true });
+        const targetPath = savePath || path.join(DOWNLOAD_DIR, resolvedFilename);
+        fs.writeFileSync(targetPath, content);
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              saved: true,
+              path: targetPath,
+              filename: resolvedFilename,
+              contentType,
+              size: content.length,
+              pages: pdfData.numpages,
+              textContent: pdfData.text,
+            }, null, 2)
+          }]
+        };
+      } catch (err) {
+        // Fall through to save-only if PDF parsing fails
+        console.error('PDF text extraction failed:', err);
+      }
+    }
+
+    // Save to shared downloads directory
+    const fs = await import('fs');
+    const path = await import('path');
+    const downloadDir = savePath ? path.dirname(savePath) : DOWNLOAD_DIR;
+    fs.mkdirSync(downloadDir, { recursive: true });
+    const targetPath = savePath || path.join(DOWNLOAD_DIR, resolvedFilename);
+    fs.writeFileSync(targetPath, content);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({
+          saved: true,
+          path: targetPath,
+          filename: resolvedFilename,
+          contentType,
+          size: content.length,
         }, null, 2)
       }]
     };
@@ -105,7 +243,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.number().describe('Email UID'),
+      uid: z.coerce.number().describe('Email UID'),
     }
   }, async ({ accountId, folder, uid }) => {
     await imapService.markAsRead(accountId, folder, uid);
@@ -127,7 +265,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.number().describe('Email UID'),
+      uid: z.coerce.number().describe('Email UID'),
     }
   }, async ({ accountId, folder, uid }) => {
     await imapService.markAsUnread(accountId, folder, uid);
@@ -149,7 +287,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.number().describe('Email UID'),
+      uid: z.coerce.number().describe('Email UID'),
     }
   }, async ({ accountId, folder, uid }) => {
     await imapService.deleteEmail(accountId, folder, uid);
@@ -165,14 +303,63 @@ export function emailTools(
     };
   });
 
+  // Move email to another folder
+  server.registerTool('imap_move_email', {
+    description: 'Move an email from one folder to another (e.g., INBOX to Taxes, or INBOX to Archive). Optionally creates the destination folder if it does not exist.',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      folder: z.string().default('INBOX').describe('Source folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+      targetFolder: z.string().describe('Destination folder name'),
+      createDestinationIfMissing: z.boolean().optional().describe('If true, create the destination folder before moving when it does not exist (default: false)'),
+    }
+  }, async ({ accountId, folder, uid, targetFolder, createDestinationIfMissing }) => {
+    try {
+      const result = await imapService.moveEmail(accountId, folder, uid, targetFolder, {
+        createDestinationIfMissing,
+      });
+
+      const uidMapObj: Record<string, number> = {};
+      if (result.uidMap) {
+        for (const [srcUid, destUid] of result.uidMap) {
+          uidMapObj[String(srcUid)] = destUid;
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            message: `Email ${uid} moved from ${folder} to ${targetFolder}`,
+            destination: result.destination,
+            destinationCreated: result.destinationCreated,
+            uidMap: Object.keys(uidMapObj).length > 0 ? uidMapObj : undefined,
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            message: `Failed to move email ${uid} from ${folder} to ${targetFolder}`,
+            error: err instanceof Error ? err.message : 'Unknown error',
+          }, null, 2)
+        }]
+      };
+    }
+  });
+
   // Bulk delete emails tool
   server.registerTool('imap_bulk_delete', {
     description: 'Delete multiple emails at once with chunking and auto-reconnection. Processes deletions in batches to prevent connection timeouts.',
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      uids: z.array(z.number()).describe('Array of email UIDs to delete'),
-      chunkSize: z.number().default(50).describe('Number of emails to delete per batch (default: 50)'),
+      uids: z.array(z.coerce.number()).describe('Array of email UIDs to delete'),
+      chunkSize: z.coerce.number().default(50).describe('Number of emails to delete per batch (default: 50)'),
     }
   }, async ({ accountId, folder, uids, chunkSize }) => {
     const result = await imapService.bulkDelete(accountId, folder, uids, chunkSize);
@@ -205,7 +392,7 @@ export function emailTools(
       subject: z.string().optional().describe('Delete emails with this subject'),
       before: z.string().optional().describe('Delete emails before this date (YYYY-MM-DD)'),
       since: z.string().optional().describe('Delete emails since this date (YYYY-MM-DD)'),
-      chunkSize: z.number().default(50).describe('Number of emails to delete per batch'),
+      chunkSize: z.coerce.number().default(50).describe('Number of emails to delete per batch'),
       dryRun: z.boolean().default(false).describe('If true, only return what would be deleted without actually deleting'),
     }
   }, async ({ accountId, folder, from, to, subject, before, since, chunkSize, dryRun }) => {
@@ -281,7 +468,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder name'),
-      count: z.number().default(10).describe('Number of emails to retrieve'),
+      count: z.coerce.number().default(10).describe('Number of emails to retrieve'),
     }
   }, async ({ accountId, folder, count }) => {
     const sortedMessages = await imapService.getLatestEmails(accountId, folder, count);
@@ -322,7 +509,7 @@ export function emailTools(
     }
 
     const emailComposer = {
-      from: account.user,
+      from: account.email || account.user,
       to,
       subject,
       text,
@@ -338,15 +525,95 @@ export function emailTools(
       })),
     };
 
-    const messageId = await smtpService.sendEmail(accountId, account, emailComposer);
-    
+    const { messageId, rawMessage } = await smtpService.sendEmail(accountId, account, emailComposer);
+
+    // Save copy to Sent folder
+    let savedToSent = false;
+    if (rawMessage && shouldSaveToSent(account)) {
+      try {
+        savedToSent = await imapService.appendToSentFolder(accountId, rawMessage);
+      } catch { /* non-critical */ }
+    }
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           success: true,
           messageId,
-          message: 'Email sent successfully',
+          savedToSent,
+          message: savedToSent ? 'Email sent successfully (saved to Sent folder)' : 'Email sent successfully',
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Save draft tool — composes a message and appends it to the Drafts folder with the \Draft flag
+  server.registerTool('imap_save_draft', {
+    description: 'Save an email as a draft in the Drafts folder (no send). Takes the same fields as imap_send_email.',
+    inputSchema: {
+      accountId: z.string().describe('Account ID to save the draft under'),
+      to: z.union([z.string(), z.array(z.string())]).optional().describe('Recipient email address(es)'),
+      subject: z.string().optional().describe('Email subject'),
+      text: z.string().optional().describe('Plain text content'),
+      html: z.string().optional().describe('HTML content'),
+      cc: z.union([z.string(), z.array(z.string())]).optional().describe('CC recipients'),
+      bcc: z.union([z.string(), z.array(z.string())]).optional().describe('BCC recipients'),
+      replyTo: z.string().optional().describe('Reply-to address'),
+      inReplyTo: z.string().optional().describe('Message-Id being replied to'),
+      references: z.union([z.string(), z.array(z.string())]).optional().describe('References header value(s)'),
+      attachments: z.array(z.object({
+        filename: z.string().describe('Attachment filename'),
+        content: z.string().optional().describe('Base64 encoded content'),
+        path: z.string().optional().describe('File path to attach'),
+        contentType: z.string().optional().describe('MIME type'),
+      })).optional().describe('Email attachments'),
+      folder: z.string().optional().describe('Override the Drafts folder name (defaults to auto-detected Drafts folder)'),
+    }
+  }, async ({ accountId, to, subject, text, html, cc, bcc, replyTo, inReplyTo, references, attachments, folder }) => {
+    const account = await accountManager.getAccount(accountId);
+    if (!account) {
+      throw new Error(`Account ${accountId} not found`);
+    }
+
+    const emailComposer = {
+      from: account.email || account.user,
+      to: to ?? '',
+      subject: subject ?? '',
+      text,
+      html,
+      cc,
+      bcc,
+      replyTo,
+      inReplyTo,
+      references,
+      attachments: attachments?.map(att => ({
+        filename: att.filename,
+        content: att.content ? Buffer.from(att.content, 'base64') : undefined,
+        path: att.path,
+        contentType: att.contentType,
+      })),
+    };
+
+    const rawMessage = await smtpService.composeRaw(account, emailComposer);
+
+    const draftsFolder = folder ?? await imapService.findDraftsFolder(accountId);
+    if (!draftsFolder) {
+      throw new Error('No Drafts folder found. Tried: Drafts, Draft, INBOX.Drafts, INBOX.Draft, [Gmail]/Drafts. Pass `folder` to override.');
+    }
+
+    const appended = await imapService.appendMessage(accountId, draftsFolder, rawMessage, ['\\Draft', '\\Seen']);
+    if (!appended) {
+      throw new Error(`Failed to append draft to folder "${draftsFolder}"`);
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          folder: draftsFolder,
+          message: `Draft saved to "${draftsFolder}"`,
         }, null, 2)
       }]
     };
@@ -358,7 +625,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder containing the original email'),
-      uid: z.number().describe('UID of the email to reply to'),
+      uid: z.coerce.number().describe('UID of the email to reply to'),
       text: z.string().optional().describe('Plain text reply content'),
       html: z.string().optional().describe('HTML reply content'),
       replyAll: z.boolean().default(false).describe('Reply to all recipients'),
@@ -381,11 +648,12 @@ export function emailTools(
     // Prepare reply
     const recipients = [originalEmail.from];
     if (replyAll) {
-      recipients.push(...originalEmail.to.filter(addr => addr !== account.user));
+      const accountEmail = account.email || account.user;
+      recipients.push(...originalEmail.to.filter(addr => addr !== accountEmail));
     }
 
     const emailComposer = {
-      from: account.user,
+      from: account.email || account.user,
       to: recipients,
       subject: originalEmail.subject.startsWith('Re: ') ? originalEmail.subject : `Re: ${originalEmail.subject}`,
       text,
@@ -400,15 +668,24 @@ export function emailTools(
       })),
     };
 
-    const messageId = await smtpService.sendEmail(accountId, account, emailComposer);
-    
+    const { messageId, rawMessage } = await smtpService.sendEmail(accountId, account, emailComposer);
+
+    // Save copy to Sent folder
+    let savedToSent = false;
+    if (rawMessage && shouldSaveToSent(account)) {
+      try {
+        savedToSent = await imapService.appendToSentFolder(accountId, rawMessage);
+      } catch { /* non-critical */ }
+    }
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           success: true,
           messageId,
-          message: 'Reply sent successfully',
+          savedToSent,
+          message: savedToSent ? 'Reply sent successfully (saved to Sent folder)' : 'Reply sent successfully',
         }, null, 2)
       }]
     };
@@ -420,7 +697,7 @@ export function emailTools(
     inputSchema: {
       accountId: z.string().describe('Account ID'),
       folder: z.string().default('INBOX').describe('Folder containing the original email'),
-      uid: z.number().describe('UID of the email to forward'),
+      uid: z.coerce.number().describe('UID of the email to forward'),
       to: z.union([z.string(), z.array(z.string())]).describe('Forward to email address(es)'),
       text: z.string().optional().describe('Additional text to include'),
       includeAttachments: z.boolean().default(true).describe('Include original attachments'),
@@ -438,7 +715,7 @@ export function emailTools(
     const forwardHeader = `\n\n---------- Forwarded message ----------\nFrom: ${originalEmail.from}\nDate: ${originalEmail.date.toLocaleString()}\nSubject: ${originalEmail.subject}\nTo: ${originalEmail.to.join(', ')}\n\n`;
     
     const emailComposer = {
-      from: account.user,
+      from: account.email || account.user,
       to,
       subject: originalEmail.subject.startsWith('Fwd: ') ? originalEmail.subject : `Fwd: ${originalEmail.subject}`,
       text: (text || '') + forwardHeader + (originalEmail.textContent || ''),
@@ -446,17 +723,70 @@ export function emailTools(
       references: originalEmail.messageId,
     };
 
-    const messageId = await smtpService.sendEmail(accountId, account, emailComposer);
-    
+    const { messageId, rawMessage } = await smtpService.sendEmail(accountId, account, emailComposer);
+
+    // Save copy to Sent folder
+    let savedToSent = false;
+    if (rawMessage && shouldSaveToSent(account)) {
+      try {
+        savedToSent = await imapService.appendToSentFolder(accountId, rawMessage);
+      } catch { /* non-critical */ }
+    }
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           success: true,
           messageId,
-          message: 'Email forwarded successfully',
+          savedToSent,
+          message: savedToSent ? 'Email forwarded successfully (saved to Sent folder)' : 'Email forwarded successfully',
         }, null, 2)
       }]
     };
+  });
+
+  // Find thread messages tool
+  server.registerTool('imap_find_thread_messages', {
+    description:
+      'Find messages in `searchFolder` that belong to the same conversation threads as messages already in `sourceFolder`. ' +
+      'Useful for catching replies that arrived after a thread was sorted. Works on any IMAP server (uses RFC 3501 HEADER search on In-Reply-To and References).',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      sourceFolder: z.string().describe('Folder containing the already-sorted thread messages (e.g. "Review.Articles")'),
+      searchFolder: z.string().default('INBOX').describe('Folder to search for related thread messages (default: INBOX)'),
+      searchReferences: z.boolean().optional().describe('Also search the References header for multi-level threads (default: true)'),
+    }
+  }, async ({ accountId, sourceFolder, searchFolder, searchReferences }) => {
+    try {
+      const result = await imapService.findThreadMessages(accountId, sourceFolder, searchFolder, {
+        searchReferences,
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            sourceFolder,
+            searchFolder,
+            sourceMessageIdCount: result.messageIds.length,
+            threadMessageCount: result.uids.length,
+            uids: result.uids,
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            sourceFolder,
+            searchFolder,
+            error: err instanceof Error ? err.message : 'Unknown error',
+          }, null, 2)
+        }]
+      };
+    }
   });
 }

@@ -9,7 +9,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderProviders();
     
     // Setup form handler
-    document.getElementById('accountForm').addEventListener('submit', handleAccountSubmit);
+    document.getElementById('accountForm').onsubmit = handleAccountSubmit;
     
     // Clear test results when form fields change
     const formFields = ['email', 'password', 'imapHost', 'imapPort'];
@@ -133,20 +133,23 @@ function goToStep(step) {
 async function handleAccountUpdate(e) {
     e.preventDefault();
     
+    const imapUsername = document.getElementById('imapUsername').value.trim();
     const accountData = {
         name: document.getElementById('accountName').value,
         email: document.getElementById('email').value,
         password: document.getElementById('password').value,
         host: document.getElementById('imapHost').value,
         port: parseInt(document.getElementById('imapPort').value),
-        tls: selectedProvider?.imapSecurity !== 'STARTTLS'
+        tls: selectedProvider?.imapSecurity !== 'STARTTLS',
+        saveToSent: document.getElementById('saveToSent').checked,
+        imapUsername: imapUsername || undefined
     };
-    
+
     // Only include password if it was changed
     if (!accountData.password) {
         delete accountData.password;
     }
-    
+
     goToStep(3);
     await updateAndTestAccount(window.editingAccountId, accountData);
 }
@@ -154,16 +157,28 @@ async function handleAccountUpdate(e) {
 // Handle account form submission
 async function handleAccountSubmit(e) {
     e.preventDefault();
-    
+
+    const password = document.getElementById('password').value;
+    if (!password) {
+        document.getElementById('inlineTestResult').classList.remove('hidden');
+        document.getElementById('inlineTestSuccess').classList.add('hidden');
+        document.getElementById('inlineTestError').classList.remove('hidden');
+        document.getElementById('inlineErrorMessage').textContent = 'Please enter a password.';
+        return;
+    }
+
+    const imapUsername = document.getElementById('imapUsername').value.trim();
     const accountData = {
         name: document.getElementById('accountName').value,
         email: document.getElementById('email').value,
         password: document.getElementById('password').value,
         host: document.getElementById('imapHost').value,
         port: parseInt(document.getElementById('imapPort').value),
-        tls: selectedProvider?.imapSecurity !== 'STARTTLS'
+        tls: selectedProvider?.imapSecurity !== 'STARTTLS',
+        saveToSent: document.getElementById('saveToSent').checked,
+        imapUsername: imapUsername || undefined
     };
-    
+
     // Add SMTP configuration if enabled
     if (document.getElementById('enableSmtp').checked) {
         accountData.smtp = {
@@ -370,14 +385,21 @@ async function editAccount(accountId) {
         // Store editing account ID
         window.editingAccountId = accountId;
         
+        // Clear any stale validation messages
+        document.getElementById('inlineTestResult').classList.add('hidden');
+        document.getElementById('inlineTestSuccess').classList.add('hidden');
+        document.getElementById('inlineTestError').classList.add('hidden');
+
         // Pre-fill form with account data
         document.getElementById('accountName').value = account.name || '';
-        document.getElementById('email').value = account.user || '';
+        document.getElementById('email').value = account.email || account.user || '';
         document.getElementById('password').value = ''; // Don't pre-fill password
         document.getElementById('password').placeholder = 'Leave blank to keep current password';
         document.getElementById('imapHost').value = account.host || '';
         document.getElementById('imapPort').value = account.port || 993;
-        
+        document.getElementById('imapUsername').value = account.email ? account.user : '';
+        document.getElementById('saveToSent').checked = account.saveToSent !== false;
+
         // Pre-fill SMTP settings if available
         if (account.smtp) {
             document.getElementById('enableSmtp').checked = true;
@@ -460,13 +482,15 @@ async function testCurrentSettings() {
     document.getElementById('inlineTestError').classList.add('hidden');
     
     // Get current form values
+    const imapUsername = document.getElementById('imapUsername').value.trim();
     const accountData = {
         name: document.getElementById('accountName').value,
         email: document.getElementById('email').value,
         password: document.getElementById('password').value,
         host: document.getElementById('imapHost').value,
         port: parseInt(document.getElementById('imapPort').value),
-        tls: selectedProvider?.imapSecurity !== 'STARTTLS'
+        tls: selectedProvider?.imapSecurity !== 'STARTTLS',
+        imapUsername: imapUsername || undefined
     };
     
     // If editing and no password provided, we can't test

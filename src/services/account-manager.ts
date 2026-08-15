@@ -13,7 +13,7 @@ export class AccountManager {
   constructor() {
     this.configPath = path.join(os.homedir(), '.imap-mcp', 'accounts.json');
     this.encryptionKey = this.getOrCreateEncryptionKey();
-    this.loadAccounts();
+    this.loadAccountsSync();
   }
 
   async addAccount(account: Omit<ImapAccount, 'id'>): Promise<ImapAccount> {
@@ -95,6 +95,7 @@ export class AccountManager {
   }
 
   getAccount(id: string): ImapAccount | undefined {
+    this.loadAccountsSync();
     const account = this.accounts.get(id);
     if (!account) return undefined;
 
@@ -132,7 +133,16 @@ export class AccountManager {
   }
 
   getAccountByName(name: string): ImapAccount | undefined {
-    const account = Array.from(this.accounts.values()).find(acc => acc.name === name);
+    const normalize = (s: string) => s.toLowerCase().replace(/[\s_-]+/g, '');
+    const target = normalize(name);
+    const all = Array.from(this.accounts.values());
+    let account = all.find(acc => acc.name === name);
+    if (!account) account = all.find(acc => acc.name.toLowerCase() === name.toLowerCase());
+    if (!account) account = all.find(acc => normalize(acc.name) === target);
+    if (!account) {
+      const prefixHits = all.filter(acc => normalize(acc.name).startsWith(target));
+      if (prefixHits.length === 1) account = prefixHits[0];
+    }
     if (!account) return undefined;
 
     const decrypted: ImapAccount = {
@@ -150,11 +160,12 @@ export class AccountManager {
     return decrypted;
   }
 
-  private async loadAccounts(): Promise<void> {
+  private loadAccountsSync(): void {
     try {
-      const data = await fs.readFile(this.configPath, 'utf-8');
+      const data = readFileSync(this.configPath, 'utf-8');
       const accounts = JSON.parse(data) as ImapAccount[];
-      
+
+      this.accounts.clear();
       for (const account of accounts) {
         this.accounts.set(account.id, account);
       }

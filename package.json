@@ -1,11 +1,12 @@
 {
   "name": "imap-mcp-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A powerful Model Context Protocol (MCP) server for IMAP email integration with Claude",
   "main": "dist/index.js",
   "bin": {
     "imap-mcp": "./dist/index.js",
-    "imap-setup": "./dist/setup.js"
+    "imap-setup": "./dist/setup.js",
+    "imap": "./dist/cli.js"
   },
   "scripts": {
     "build": "node build.mjs",
@@ -43,6 +44,7 @@
     "@types/express": "^5.0.3",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^24.0.14",
+    "@types/pdf-parse": "^1.1.5",
     "@vitest/coverage-v8": "^4.0.16",
     "esbuild": "^0.27.2",
     "nodemon": "^3.1.10",
@@ -51,7 +53,7 @@
     "vitest": "^4.0.16"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "@types/nodemailer": "^6.4.17",
     "body-parser": "^2.2.0",
     "chalk": "^5.4.1",
@@ -59,11 +61,12 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.0",
     "express": "^5.1.0",
-    "imapflow": "^1.2.1",
-    "mailparser": "^3.7.4",
-    "nodemailer": "^7.0.5",
+    "imapflow": "^1.3.1",
+    "mailparser": "^3.9.8",
+    "nodemailer": "^8.0.5",
     "open": "^10.2.0",
     "ora": "^8.2.0",
+    "pdf-parse": "^1.1.1",
     "zod": "^3.25.76"
   },
   "overrides": {

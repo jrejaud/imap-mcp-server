@@ -1,6 +1,86 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { ImapAccount, EmailMessage, EmailContent, Folder, SearchCriteria } from '../types/index.js';
+import type { AccountManager } from './account-manager.js';
+
+/**
+ * Providers that require IMAP access to be manually enabled in account settings.
+ * Each entry maps a host pattern to a human-readable hint.
+ */
+const PROVIDERS_REQUIRING_IMAP_ENABLE: Array<{ pattern: RegExp; name: string; settingsPath: string }> = [
+  {
+    pattern: /gmx\.(net|de|at|ch|com)/i,
+    name: 'GMX',
+    settingsPath: 'Settings → Email → POP3 & IMAP → Enable IMAP access',
+  },
+  {
+    pattern: /web\.de/i,
+    name: 'WEB.DE',
+    settingsPath: 'Settings → Email → POP3 & IMAP → Enable IMAP access',
+  },
+  {
+    pattern: /zoho\.(com|eu)/i,
+    name: 'Zoho Mail',
+    settingsPath: 'Settings → Mail Accounts → IMAP Access → Enable',
+  },
+  {
+    pattern: /yahoo\.(com|de|co\.uk|fr|es|it)/i,
+    name: 'Yahoo Mail',
+    settingsPath: 'Account Security settings → Generate app password',
+  },
+  {
+    pattern: /gmail\.com|googlemail\.com/i,
+    name: 'Gmail',
+    settingsPath: 'Settings → See all settings → Forwarding and POP/IMAP → Enable IMAP',
+  },
+];
+
+/**
+ * Error message patterns that indicate IMAP access is disabled at the provider.
+ */
+const IMAP_DISABLED_PATTERNS = [
+  /imap.*disabled/i,
+  /imap.*not.*enabled/i,
+  /imap.*access.*denied/i,
+  /\[UNAVAILABLE\]/i,
+  /\[ALERT\].*imap/i,
+  /imap.*not.*activated/i,
+  /please.*enable.*imap/i,
+  /enable.*imap.*access/i,
+  /pop3.*imap.*disabled/i,
+];
+
+/**
+ * Enriches a connection error with a provider-specific hint when IMAP access
+ * may need to be manually enabled in the account settings.
+ */
+function enrichConnectionError(error: unknown, host: string): string {
+  const originalMessage = error instanceof Error ? error.message : 'Connection failed';
+
+  // Check if the error message already indicates IMAP is disabled
+  const looksLikeImapDisabled = IMAP_DISABLED_PATTERNS.some(pattern => pattern.test(originalMessage));
+
+  if (!looksLikeImapDisabled) {
+    return originalMessage;
+  }
+
+  const matchedProvider = PROVIDERS_REQUIRING_IMAP_ENABLE.find(p => p.pattern.test(host));
+
+  if (matchedProvider) {
+    return (
+      `${originalMessage}\n\n` +
+      `Hint: ${matchedProvider.name} requires IMAP access to be manually enabled. ` +
+      `Go to: ${matchedProvider.settingsPath}`
+    );
+  }
+
+  // Generic hint when error looks IMAP-related but provider is unknown
+  return (
+    `${originalMessage}\n\n` +
+    `Hint: Some providers (e.g. GMX, WEB.DE, Zoho) require IMAP access to be manually enabled ` +
+    `in the account settings (usually under Settings → Email → POP3 & IMAP).`
+  );
+}
 
 interface ConnectionState {
   client: ImapFlow;
@@ -18,6 +98,11 @@ export class ImapService {
   private connections: Map<string, ConnectionState> = new Map();
   private reconnectAttempts: Map<string, number> = new Map();
   private maxReconnectAttempts = 3;
+  private accountManager?: AccountManager;
+
+  setAccountManager(accountManager: AccountManager): void {
+    this.accountManager = accountManager;
+  }
 
   async connect(account: ImapAccount): Promise<void> {
     const existing = this.connections.get(account.id);
@@ -32,6 +117,7 @@ export class ImapService {
       auth: {
         user: account.user,
         pass: account.password,
+        loginMethod: account.loginMethod,
       },
       logger: false,
     });
@@ -52,7 +138,11 @@ export class ImapService {
       }
     });
 
-    await client.connect();
+    try {
+      await client.connect();
+    } catch (err) {
+      throw new Error(enrichConnectionError(err, account.host));
+    }
 
     this.connections.set(account.id, {
       client,
@@ -76,9 +166,19 @@ export class ImapService {
   }
 
   private async ensureConnected(accountId: string): Promise<ImapFlow> {
-    const state = this.connections.get(accountId);
+    let state = this.connections.get(accountId);
     if (!state) {
-      throw new Error(`No connection configured for account ${accountId}`);
+      // Auto-connect using stored account credentials
+      if (this.accountManager) {
+        const account = this.accountManager.getAccount(accountId);
+        if (account) {
+          await this.connect(account);
+          state = this.connections.get(accountId);
+        }
+      }
+      if (!state) {
+        throw new Error(`No connection configured for account ${accountId}`);
+      }
     }
 
     if (!state.isConnected || !state.client.usable) {
@@ -97,7 +197,7 @@ export class ImapService {
         this.reconnectAttempts.set(accountId, 0);
       } catch (err) {
         state.isConnected = false;
-        throw new Error(`Failed to reconnect: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        throw new Error(`Failed to reconnect: ${enrichConnectionError(err, state.account.host)}`);
       }
     }
 
@@ -133,6 +233,30 @@ export class ImapService {
   async selectFolder(accountId: string, folderName: string): Promise<any> {
     const client = await this.ensureConnected(accountId);
     return await client.mailboxOpen(folderName);
+  }
+
+  async getFolderStatus(accountId: string, folderName: string): Promise<{
+    messages: number;
+    recent: number;
+    unseen: number;
+    uidValidity: number;
+    uidNext: number;
+  }> {
+    const client = await this.ensureConnected(accountId);
+    const status = await client.status(folderName, {
+      messages: true,
+      recent: true,
+      unseen: true,
+      uidNext: true,
+      uidValidity: true,
+    });
+    return {
+      messages: Number(status.messages ?? 0),
+      recent: Number(status.recent ?? 0),
+      unseen: Number(status.unseen ?? 0),
+      uidValidity: Number(status.uidValidity ?? 0),
+      uidNext: Number(status.uidNext ?? 0),
+    };
   }
 
   async searchEmails(accountId: string, folderName: string, criteria: SearchCriteria): Promise<EmailMessage[]> {
@@ -251,6 +375,30 @@ export class ImapService {
         maxAttachmentTextChars = 100000,
       } = options;
       const textAttachmentExtensions = ['.txt', '.md', '.markdown', '.csv', '.log', '.json', '.xml', '.yml', '.yaml'];
+      const pdfExtensions = ['.pdf'];
+
+      // Extract all raw headers as key-value pairs
+      const headers: Record<string, string | string[]> = {};
+      if (parsed.headers) {
+        const headerToString = (v: unknown): string => {
+          if (typeof v === 'string') return v;
+          if (v instanceof Date) return v.toISOString();
+          if (v && typeof v === 'object' && 'text' in v) return String((v as { text: string }).text);
+          if (v && typeof v === 'object' && 'value' in v) return String((v as { value: string }).value);
+          if (v && typeof v === 'object') return JSON.stringify(v);
+          return String(v);
+        };
+
+        for (const [key, value] of parsed.headers) {
+          if (typeof value === 'string') {
+            headers[key] = value;
+          } else if (Array.isArray(value)) {
+            headers[key] = value.map(headerToString);
+          } else {
+            headers[key] = headerToString(value);
+          }
+        }
+      }
 
       return {
         uid,
@@ -261,9 +409,10 @@ export class ImapService {
         messageId: parsed.messageId || '',
         inReplyTo: parsed.inReplyTo as string | undefined,
         flags: Array.from(source.flags || []),
+        headers,
         textContent: parsed.text,
         htmlContent: parsed.html || undefined,
-        attachments: parsed.attachments?.map((att: any) => {
+        attachments: await Promise.all((parsed.attachments || []).map(async (att: any) => {
           const filename = att.filename || 'unknown';
           const contentType = att.contentType || 'application/octet-stream';
           const size = att.size || 0;
@@ -286,6 +435,29 @@ export class ImapService {
           const hasTextExtension = textAttachmentExtensions.some(ext => filenameLower.endsWith(ext));
           const isTextAttachment = isTextContentType || hasTextExtension;
 
+          // Check if this is a PDF
+          const isPdf = contentTypeLower === 'application/pdf' || pdfExtensions.some(ext => filenameLower.endsWith(ext));
+
+          if (isPdf && att?.content) {
+            try {
+              const pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default;
+              const contentBuffer = Buffer.isBuffer(att.content) ? att.content : Buffer.from(att.content);
+              const pdfData = await pdfParse(contentBuffer);
+              const rawText = pdfData.text;
+              const textTruncated = rawText.length > maxAttachmentTextChars;
+              const textContent = textTruncated ? rawText.slice(0, maxAttachmentTextChars) : rawText;
+
+              return {
+                ...attachment,
+                textContent,
+                textContentTruncated: textTruncated || undefined,
+              };
+            } catch {
+              // PDF parsing failed, return without text
+              return attachment;
+            }
+          }
+
           if (!isTextAttachment) {
             return attachment;
           }
@@ -305,8 +477,62 @@ export class ImapService {
             textContent,
             textContentTruncated: textTruncated || undefined,
           };
-        }) || [],
+        })),
       };
+    } finally {
+      if (lock) {
+        lock.release();
+      }
+    }
+  }
+
+  async getAttachmentContent(
+    accountId: string,
+    folderName: string,
+    uid: number,
+    filename: string
+  ): Promise<{ content: Buffer; contentType: string; filename: string }> {
+    const client = await this.ensureConnected(accountId);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+
+      const source = await client.fetchOne(uid, { source: true }, { uid: true });
+
+      if (!source || !source.source) {
+        throw new Error(`Email with UID ${uid} not found`);
+      }
+
+      const parsed = await simpleParser(source.source);
+      const attachment = parsed.attachments?.find(
+        (att: any) => att.filename === filename || att.contentId === filename
+      );
+
+      if (!attachment) {
+        throw new Error(`Attachment "${filename}" not found in email UID ${uid}`);
+      }
+
+      return {
+        content: attachment.content,
+        contentType: attachment.contentType || 'application/octet-stream',
+        filename: attachment.filename || 'unknown',
+      };
+    } finally {
+      if (lock) {
+        lock.release();
+      }
+    }
+  }
+
+  async uidExists(accountId: string, folderName: string, uid: number): Promise<boolean> {
+    const client = await this.ensureConnected(accountId);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+      const msg = await client.fetchOne(String(uid), { uid: true }, { uid: true });
+      return !!msg && (msg as any).uid === uid;
     } finally {
       if (lock) {
         lock.release();
@@ -344,11 +570,20 @@ export class ImapService {
 
   async deleteEmail(accountId: string, folderName: string, uid: number): Promise<void> {
     const client = await this.ensureConnected(accountId);
+    const connState = this.connections.get(accountId);
+    const isGmail = connState?.account?.host?.includes('gmail') || connState?.account?.host?.includes('google');
+    const trashFolder = isGmail ? '[Gmail]/Trash' : 'Trash';
 
     let lock;
     try {
       lock = await client.getMailboxLock(folderName);
-      await client.messageDelete(uid, { uid: true });
+      if (folderName === trashFolder) {
+        // Already in Trash, permanently delete
+        await client.messageDelete(uid, { uid: true });
+      } else {
+        // Move to Trash instead of permanent expunge
+        await client.messageMove(uid, trashFolder, { uid: true });
+      }
     } finally {
       if (lock) {
         lock.release();
@@ -364,6 +599,10 @@ export class ImapService {
     onProgress?: (deleted: number, total: number) => void
   ): Promise<{ deleted: number; failed: number; errors: string[] }> {
     const client = await this.ensureConnected(accountId);
+    const connState = this.connections.get(accountId);
+    const isGmail = connState?.account?.host?.includes('gmail') || connState?.account?.host?.includes('google');
+    const trashFolder = isGmail ? '[Gmail]/Trash' : 'Trash';
+    const isAlreadyInTrash = folderName === trashFolder;
 
     let deleted = 0;
     let failed = 0;
@@ -380,9 +619,13 @@ export class ImapService {
 
         lock = await client.getMailboxLock(folderName);
 
-        // Use sequence set for bulk delete
+        // Use sequence set for bulk operations
         const uidSet = chunk.join(',');
-        await client.messageDelete(uidSet, { uid: true });
+        if (isAlreadyInTrash) {
+          await client.messageDelete(uidSet, { uid: true });
+        } else {
+          await client.messageMove(uidSet, trashFolder, { uid: true });
+        }
 
         deleted += chunk.length;
 
@@ -408,17 +651,165 @@ export class ImapService {
     return { deleted, failed, errors };
   }
 
-  async moveEmail(accountId: string, folderName: string, uid: number, targetFolder: string): Promise<void> {
+  async moveEmail(
+    accountId: string,
+    folderName: string,
+    uid: number,
+    targetFolder: string,
+    options?: { createDestinationIfMissing?: boolean },
+  ): Promise<{ path: string; destination: string; destinationCreated?: boolean; uidMap?: Map<number, number> }> {
     const client = await this.ensureConnected(accountId);
+
+    let destinationCreated = false;
+    if (options?.createDestinationIfMissing) {
+      const exists = await this.folderExists(accountId, targetFolder);
+      if (!exists) {
+        await this.createFolder(accountId, targetFolder);
+        destinationCreated = true;
+      }
+    }
 
     let lock;
     try {
       lock = await client.getMailboxLock(folderName);
-      await client.messageMove(uid, targetFolder, { uid: true });
+      const result = await client.messageMove(uid, targetFolder, { uid: true });
+
+      if (!result) {
+        throw new Error(`Failed to move email UID ${uid} from ${folderName} to ${targetFolder}`);
+      }
+
+      return {
+        path: result.path,
+        destination: result.destination,
+        destinationCreated: destinationCreated || undefined,
+        uidMap: result.uidMap,
+      };
     } finally {
       if (lock) {
         lock.release();
       }
+    }
+  }
+
+  async folderExists(accountId: string, folderPath: string): Promise<boolean> {
+    const client = await this.ensureConnected(accountId);
+    const list = await client.list();
+    return list.some(f => f.path === folderPath);
+  }
+
+  async createFolder(
+    accountId: string,
+    folderPath: string,
+  ): Promise<{ path: string; created: boolean; alreadyExisted: boolean }> {
+    const client = await this.ensureConnected(accountId);
+    try {
+      const result = await client.mailboxCreate(folderPath);
+      const path = (result && typeof result === 'object' && 'path' in result) ? (result as any).path : folderPath;
+      const created = (result && typeof result === 'object' && 'created' in result) ? Boolean((result as any).created) : true;
+      return {
+        path,
+        created,
+        alreadyExisted: !created,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // ImapFlow throws on already-existing mailboxes; treat that as a non-error.
+      if (/already exists|exists/i.test(message)) {
+        return { path: folderPath, created: false, alreadyExisted: true };
+      }
+      throw new Error(`Failed to create folder "${folderPath}": ${message}`);
+    }
+  }
+
+  async findThreadMessages(
+    accountId: string,
+    sourceFolder: string,
+    searchFolder: string,
+    options?: { searchReferences?: boolean },
+  ): Promise<{ messageIds: string[]; uids: number[] }> {
+    const client = await this.ensureConnected(accountId);
+    const includeReferences = options?.searchReferences !== false;
+
+    // 1) Collect Message-IDs from sourceFolder
+    const messageIds: string[] = [];
+    let lock = await client.getMailboxLock(sourceFolder);
+    try {
+      const allUids = await client.search({ all: true }, { uid: true });
+      if (allUids.length > 0) {
+        for await (const msg of client.fetch(allUids, { uid: true, envelope: true }, { uid: true })) {
+          if (msg.envelope?.messageId) {
+            messageIds.push(msg.envelope.messageId);
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+
+    if (messageIds.length === 0) {
+      return { messageIds: [], uids: [] };
+    }
+
+    // 2) For each Message-ID, search In-Reply-To (and optionally References) in searchFolder
+    const foundUids = new Set<number>();
+    lock = await client.getMailboxLock(searchFolder);
+    try {
+      for (const msgId of messageIds) {
+        try {
+          const inReplyMatches = await client.search(
+            { header: { 'in-reply-to': msgId } as any },
+            { uid: true },
+          );
+          for (const uid of inReplyMatches) foundUids.add(uid);
+
+          if (includeReferences) {
+            const refMatches = await client.search(
+              { header: { 'references': msgId } as any },
+              { uid: true },
+            );
+            for (const uid of refMatches) foundUids.add(uid);
+          }
+        } catch {
+          // Skip per-message errors so one bad search doesn't kill the whole sweep
+        }
+      }
+    } finally {
+      lock.release();
+    }
+
+    return {
+      messageIds,
+      uids: Array.from(foundUids).sort((a, b) => a - b),
+    };
+  }
+
+  async appendToSentFolder(accountId: string, rawMessage: Buffer | string): Promise<boolean> {
+    const sentFolderNames = ['Sent Messages', 'Sent', 'INBOX.Sent', 'Sent Items', 'Sent Mail', '[Gmail]/Sent Mail'];
+    const folder = await this.findFolderByNames(accountId, sentFolderNames);
+    if (!folder) {
+      console.warn(`[IMAP] No sent folder found for account ${accountId}. Tried: ${sentFolderNames.join(', ')}`);
+      return false;
+    }
+    return this.appendMessage(accountId, folder, rawMessage, ['\\Seen']);
+  }
+
+  async findFolderByNames(accountId: string, candidates: string[]): Promise<string | undefined> {
+    const folders = await this.listFolders(accountId);
+    return folders.find(f => candidates.includes(f.name))?.name;
+  }
+
+  async findDraftsFolder(accountId: string): Promise<string | undefined> {
+    return this.findFolderByNames(accountId, ['Drafts', 'Draft', 'INBOX.Drafts', 'INBOX.Draft', '[Gmail]/Drafts']);
+  }
+
+  async appendMessage(accountId: string, folder: string, rawMessage: Buffer | string, flags?: string[]): Promise<boolean> {
+    const client = await this.ensureConnected(accountId);
+    try {
+      await client.append(folder, rawMessage, flags ?? []);
+      return true;
+    } catch (err) {
+      console.error(`[IMAP] Failed to append to ${folder}:`, err instanceof Error ? err.message : err);
+      return false;
     }
   }
 
@@ -430,6 +821,7 @@ export class ImapService {
       auth: {
         user: account.user,
         pass: account.password,
+        loginMethod: account.loginMethod,
       },
       logger: false,
     });
@@ -460,7 +852,7 @@ export class ImapService {
     } catch (err) {
       return {
         success: false,
-        error: err instanceof Error ? err.message : 'Connection failed',
+        error: enrichConnectionError(err, account.host),
       };
     }
   }

@@ -17,9 +17,6 @@ await esbuild.build({
   format: 'esm',
   outfile: 'dist/index.js',
   external,
-  banner: {
-    js: '#!/usr/bin/env node',
-  },
 });
 
 // Build setup entry point
@@ -30,9 +27,6 @@ await esbuild.build({
   format: 'esm',
   outfile: 'dist/setup.js',
   external,
-  banner: {
-    js: '#!/usr/bin/env node',
-  },
 });
 
 // Build web server entry point
@@ -42,6 +36,17 @@ await esbuild.build({
   platform: 'node',
   format: 'esm',
   outfile: 'dist/web/server.js',
+  external,
+});
+
+// Build CLI entry point — host-installable `imap` binary
+// (shebang lives in src/cli.ts and is preserved by esbuild)
+await esbuild.build({
+  entryPoints: ['src/cli.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  outfile: 'dist/cli.js',
   external,
 });
 

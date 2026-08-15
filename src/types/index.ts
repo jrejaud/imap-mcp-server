@@ -6,10 +6,12 @@ export interface ImapAccount {
   user: string;
   password: string;
   tls: boolean;
+  email?: string;
   authTimeout?: number;
   connTimeout?: number;
   keepalive?: boolean;
   smtp?: SmtpConfig;
+  saveToSent?: boolean;
 }
 
 export interface SmtpConfig {
@@ -38,6 +40,7 @@ export interface EmailMessage {
 export interface EmailContent extends EmailMessage {
   textContent?: string;
   htmlContent?: string;
+  headers: Record<string, string | string[]>;
   attachments: Attachment[];
 }
 

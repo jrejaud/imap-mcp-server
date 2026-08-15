@@ -6,7 +6,7 @@ A powerful Model Context Protocol (MCP) server that provides seamless IMAP email
 
 - 🔐 **Secure Account Management**: Encrypted credential storage with AES-256 encryption
 - 🚀 **Connection Pooling**: Efficient IMAP connection management
-- 📧 **Comprehensive Email Operations**: Search, read, mark, delete emails
+- 📧 **Comprehensive Email Operations**: Search, read, move, mark, delete, and bulk delete emails
 - ✉️ **Email Sending**: Send, reply, and forward emails via SMTP
 - 📁 **Folder Management**: List folders, check status, get unread counts
 - 🔄 **Multiple Account Support**: Manage multiple IMAP accounts simultaneously
@@ -88,7 +88,41 @@ The setup wizard includes pre-configured settings for:
 
 ## Configuration
 
-### Claude Desktop Configuration
+### Claude Code (CLI)
+
+If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in the terminal, add the MCP server with a single command:
+
+**Step 1:** Make sure you have built the project first (see [Manual Installation](#manual-installation)).
+
+**Step 2:** Run this command in your terminal:
+
+```bash
+claude mcp add imap -- node /absolute/path/to/imap-mcp-server/dist/index.js
+```
+
+> **Important:** Replace `/absolute/path/to/imap-mcp-server` with the actual path where you cloned the repository. For example:
+> ```bash
+> # macOS/Linux example:
+> claude mcp add imap -- node /Users/yourname/imap-mcp-server/dist/index.js
+>
+> # Windows example:
+> claude mcp add imap -- node C:\Users\yourname\imap-mcp-server\dist\index.js
+> ```
+
+**Step 3:** Verify it was added:
+
+```bash
+claude mcp list
+```
+
+You should see `imap` in the list of configured MCP servers. That's it — the IMAP tools are now available in your Claude Code sessions.
+
+> **Tip:** If you want to remove the server later, run:
+> ```bash
+> claude mcp remove imap
+> ```
+
+### Claude Desktop (GUI App)
 
 Add the IMAP MCP server to your Claude Desktop configuration file:
 
@@ -100,7 +134,7 @@ Add the IMAP MCP server to your Claude Desktop configuration file:
   "mcpServers": {
     "imap": {
       "command": "node",
-      "args": ["/path/to/ImapClient/dist/index.js"],
+      "args": ["/path/to/imap-mcp-server/dist/index.js"],
       "env": {}
     }
   }
@@ -192,6 +226,56 @@ Once configured, the IMAP MCP server provides the following tools in Claude:
   - uid: Email UID
   ```
 
+- **imap_move_email**: Move an email from one folder to another
+  ```
+  Parameters:
+  - accountId: Account ID
+  - folder: Source folder name (default: INBOX)
+  - uid: Email UID
+  - targetFolder: Destination folder name
+  - createDestinationIfMissing: Create the destination folder if it does not exist (default: false)
+  ```
+
+- **imap_find_thread_messages**: Find inbox messages that belong to the same conversation threads as messages already sorted into another folder. Uses RFC 3501 HEADER search on In-Reply-To and References — works on any IMAP server.
+  ```
+  Parameters:
+  - accountId: Account ID
+  - sourceFolder: Folder containing the already-sorted thread messages
+  - searchFolder: Folder to search for related messages (default: INBOX)
+  - searchReferences: Also match the References header for multi-level threads (default: true)
+  ```
+
+- **imap_download_attachment**: Download an email attachment (returns images inline, extracts text from PDFs, or saves to downloads directory)
+  ```
+  Parameters:
+  - accountId: Account ID
+  - folder: Folder name (default: INBOX)
+  - uid: Email UID
+  - filename: Attachment filename or contentId
+  - savePath: Optional file path to save the attachment to
+  - extractText: For PDFs, extract and return text content inline (default: true)
+  ```
+
+- **imap_bulk_delete**: Delete multiple emails at once with chunking and auto-reconnection
+  ```
+  Parameters:
+  - accountId: Account ID
+  - folder: Folder name (default: INBOX)
+  - uids: Array of email UIDs to delete
+  - chunkSize: Emails to delete per batch (default: 50)
+  ```
+
+- **imap_bulk_delete_by_search**: Search for emails matching criteria and delete them all
+  ```
+  Parameters:
+  - accountId: Account ID
+  - folder: Folder name (default: INBOX)
+  - from, to, subject: Search criteria (optional)
+  - before, since: Date filters (optional)
+  - chunkSize: Emails to delete per batch (default: 50)
+  - dryRun: Preview what would be deleted without deleting (default: false)
+  ```
+
 - **imap_send_email**: Send a new email
   ```
   Parameters:
@@ -246,6 +330,13 @@ Once configured, the IMAP MCP server provides the following tools in Claude:
   Parameters:
   - accountId: Account ID
   - folder: Folder name
+  ```
+
+- **imap_create_folder**: Create a new IMAP folder/mailbox. Most servers also create any missing parent folders. Returns success even if the folder already exists.
+  ```
+  Parameters:
+  - accountId: Account ID
+  - folder: Full folder path to create (e.g. "Archives/2026/2026-05" or "INBOX.Archive")
   ```
 
 - **imap_get_unread_count**: Count unread emails
@@ -314,7 +405,10 @@ src/
 6. **Forward emails:**
    "Forward the email with subject 'Meeting Notes' to team@company.com"
 
-7. **Manage folders:**
+7. **Move an email:**
+   "Move the invoice email from INBOX to my Taxes folder"
+
+8. **Manage folders:**
    "List all folders in my email account and show unread counts"
 
 ## Troubleshooting

@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import { ImapAccount, EmailComposer, SmtpConfig } from '../types/index.js';
 
 export class SmtpService {
@@ -10,11 +11,13 @@ export class SmtpService {
     }
 
     const smtpConfig = account.smtp || this.getDefaultSmtpConfig(account);
-    
+    const { secure, requireTLS } = this.resolveTlsMode(smtpConfig.port, smtpConfig.secure);
+
     const transporterOptions = {
       host: smtpConfig.host,
       port: smtpConfig.port,
-      secure: smtpConfig.secure,
+      secure,
+      requireTLS,
       auth: {
         user: smtpConfig.user || account.user,
         pass: smtpConfig.password || account.password,
@@ -29,6 +32,14 @@ export class SmtpService {
     
     this.transporters.set(account.id, transporter);
     return transporter;
+  }
+
+  // Port 465 is implicit TLS (SMTPS); 587/25 are submission ports that upgrade via STARTTLS.
+  // A stored `secure: true` on port 587 is almost always a UI mistake — normalize it.
+  private resolveTlsMode(port: number, secure: boolean): { secure: boolean; requireTLS: boolean } {
+    if (port === 465) return { secure: true, requireTLS: false };
+    if (port === 587 || port === 25) return { secure: false, requireTLS: true };
+    return { secure, requireTLS: !secure };
   }
 
   private getDefaultSmtpConfig(account: ImapAccount): SmtpConfig {
@@ -64,6 +75,16 @@ export class SmtpService {
         port: 587,
         secure: false,
       },
+      'imap.zoho.com': {
+        host: 'smtp.zoho.com',
+        port: 465,
+        secure: true,
+      },
+      'imappro.zoho.com': {
+        host: 'smtppro.zoho.com',
+        port: 465,
+        secure: true,
+      },
     };
 
     const providerConfig = commonProviders[account.host];
@@ -71,41 +92,62 @@ export class SmtpService {
       return providerConfig;
     }
 
-    // Default: assume SMTP server is on same host with standard ports
+    // Default: submission port 587 with STARTTLS (RFC 8314 recommended).
+    // Guess SMTP host: rewrite imap.* to smtp.* if present, otherwise reuse the IMAP host.
+    const smtpHost = account.host.startsWith('imap.') || account.host.startsWith('imap-')
+      ? account.host.replace(/^imap[.-]/, (m) => m === 'imap.' ? 'smtp.' : 'smtp-')
+      : account.host;
     return {
-      host: account.host.replace('imap.', 'smtp.').replace('imap-', 'smtp-'),
-      port: account.tls ? 465 : 587,
-      secure: account.port === 993,
+      host: smtpHost,
+      port: 587,
+      secure: false,
     };
   }
 
-  async sendEmail(accountId: string, account: ImapAccount, email: EmailComposer): Promise<string> {
+  private toMailOptions(account: ImapAccount, email: EmailComposer): nodemailer.SendMailOptions {
+    return {
+      from: email.from || account.email || account.user,
+      to: email.to,
+      cc: email.cc,
+      bcc: email.bcc,
+      subject: email.subject,
+      text: email.text,
+      html: email.html,
+      attachments: email.attachments?.map(att => ({
+        filename: att.filename,
+        content: att.content,
+        path: att.path,
+        contentType: att.contentType,
+        contentDisposition: att.contentDisposition,
+        cid: att.cid,
+      })),
+      replyTo: email.replyTo,
+      inReplyTo: email.inReplyTo,
+      references: Array.isArray(email.references) ? email.references.join(' ') : email.references,
+    };
+  }
+
+  // Build the raw RFC 822 message without sending. Used for drafts and Sent-folder copies.
+  async composeRaw(account: ImapAccount, email: EmailComposer): Promise<Buffer> {
+    const compiled = new MailComposer(this.toMailOptions(account, email));
+    return compiled.compile().build();
+  }
+
+  async sendEmail(accountId: string, account: ImapAccount, email: EmailComposer): Promise<{ messageId: string; rawMessage?: Buffer }> {
     try {
       const transporter = await this.createTransporter(account);
-      
-      const mailOptions: nodemailer.SendMailOptions = {
-        from: email.from || account.user,
-        to: email.to,
-        cc: email.cc,
-        bcc: email.bcc,
-        subject: email.subject,
-        text: email.text,
-        html: email.html,
-        attachments: email.attachments?.map(att => ({
-          filename: att.filename,
-          content: att.content,
-          path: att.path,
-          contentType: att.contentType,
-          contentDisposition: att.contentDisposition,
-          cid: att.cid,
-        })),
-        replyTo: email.replyTo,
-        inReplyTo: email.inReplyTo,
-        references: Array.isArray(email.references) ? email.references.join(' ') : email.references,
-      };
+      const mailOptions = this.toMailOptions(account, email);
+
+      // Build raw message for IMAP Sent folder append
+      let rawMessage: Buffer | undefined;
+      try {
+        rawMessage = await this.composeRaw(account, email);
+      } catch {
+        // Non-critical: sent folder copy will be skipped
+      }
 
       const info = await transporter.sendMail(mailOptions);
-      return info.messageId;
+      return { messageId: info.messageId, rawMessage };
     } catch (error) {
       throw new Error(`Failed to send email: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
